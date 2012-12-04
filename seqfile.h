@@ -3,6 +3,9 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <sqlite3.h>
+
+#define INDEX_CACHE_NUM 4096
 
 #define ERROR_WHEN_NONENTITY 0
 #define CREATE_WHEN_NONENTITY 1
@@ -28,16 +31,32 @@
 #define SEQFILE_FLUSHERR -18
 #define SEQFILE_ENDOFILERR -19
 
+#define INDEXFILE_DIRERR -80
+#define INDEXFILE_OPENERR -81
+#define INDEXFILE_CLOSERR -82
+#define INDEXFILE_EXECERR -83
+#define INDEXFILE_INFOERR -84
+#define INDEXFILE_OVERTOPERR -85
+
 #define SMLFILE_INFOERR -100
 #define SMLFILE_NAMERR -101
 #define SMLFILE_CONTENTERR -102
 #define SMLFILE_SIZERR -103
+#define SMLFILE_NONENTITY -104
+
+struct indexfile_info {
+    char fname[256];
+    uint64_t num;
+    uint64_t pos;
+    uint32_t len;
+};
 
 struct seqfile_info {
     /* public */
     char pdir[128];
     char fname[128];
     uint8_t crt_tag;            /* ERROR_WHEN_NONENTITY, CREATE_WHEN_NONENTITY */
+    char index_dir[128];
     
     /* private */
     FILE *fd;
@@ -46,6 +65,12 @@ struct seqfile_info {
     char sync_str[64];
     uint16_t head_len;
     uint64_t end_pos;
+    sqlite3 *index_db;
+    uint16_t cache_num;
+    struct indexfile_info info[INDEX_CACHE_NUM];
+    
+    /* callback info */
+    char *err_msg;
 };
 
 struct smlfile_info {
@@ -59,7 +84,8 @@ extern int8_t open_seqfile(struct seqfile_info *seq_info);
 extern int8_t write_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_info);
 extern int8_t flush_seqfile(struct seqfile_info *seq_info);
 extern int8_t goto_1st_smlfile(struct seqfile_info *seq_info);
-extern int8_t read_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_info);
+extern int8_t read_seqfile_order(struct seqfile_info *seq_info, struct smlfile_info *sml_info);
+extern int8_t read_seqfile_by_name(struct seqfile_info *seq_info, struct smlfile_info *sml_info);
 extern int8_t close_seqfile(struct seqfile_info *seq_info);
 
 #endif

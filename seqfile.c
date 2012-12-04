@@ -62,10 +62,6 @@ int8_t check_seq_info(struct seqfile_info *seq_info)
     struct stat64 buff;
     char seq_name[512];
     
-    if (!seq_info) {
-        return SEQFILE_INFOERR;
-    }
-    
     len = strlen(seq_info->pdir);
     if (0==len || len>=128) {
         return SEQFILE_DIRERR;
@@ -73,6 +69,18 @@ int8_t check_seq_info(struct seqfile_info *seq_info)
     memset(&buff, 0, sizeof(buff));
     if (stat64(seq_info->pdir,&buff)<0 || !S_ISDIR(buff.st_mode)) {
         return SEQFILE_DIRERR;
+    }
+
+    len = strlen(seq_info->index_dir);
+    if (0 == len) {
+        strcpy(seq_info->index_dir, seq_info->pdir);
+    } else if (len >= 128) {
+        return INDEXFILE_DIRERR;
+    } else {
+        memset(&buff, 0, sizeof(buff));
+        if (stat64(seq_info->index_dir,&buff)<0 || !S_ISDIR(buff.st_mode)) {
+            return INDEXFILE_DIRERR;
+        }
     }
     
     len = strlen(seq_info->fname);
@@ -243,12 +251,160 @@ ALIGNING_ERR:
     return ret;
 }
 
-/* todo sync init index file */
+int get_indexinfo(void *info, int count, char **value, char **name)
+{
+    int i;
+    struct indexfile_info *index_info;
+    
+    index_info = (struct indexfile_info *)info;
+    index_info->num++;
+    for (i=0; i<count; i++) {
+        if (0 == strcmp(name[i],"pos")) {
+            sscanf(value[i], "%llu", &(index_info->pos));
+        } else if (0 == strcmp(name[i],"len")) {
+            sscanf(value[i], "%llu", &(index_info->len));
+        }
+    }
+    
+    return 0;
+}
+
+int8_t fill_indexfile(struct seqfile_info *seq_info, uint64_t index_end_pos)
+{
+    int8_t ret;
+    uint64_t last_pos;
+    uint32_t last_len;
+    char sql_str[256];
+    char index_name[512];
+    int64_t beg_pos, end_pos;
+    struct smlfile_info sml_info;
+    
+    if (fseeko64(seq_info->fd,index_end_pos,SEEK_SET) < 0) {
+        if (fclose(seq_info->fd)) {
+            return SEQFILE_CLOSERR;
+        }
+        return SEQFILE_SEEKERR;
+    }
+    seq_info->end_tag = SEQ_END_NO;
+    
+    memset(sql_str, 0, sizeof(sql_str));
+    strcpy(sql_str, "begin transaction;");
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    beg_pos = 0;
+    end_pos = 0;
+    while (1) {
+        if (0==beg_pos && 0==end_pos) {
+            beg_pos = ftello64(seq_info->fd);
+            if (beg_pos < 0) {
+                if (fclose(seq_info->fd)) {
+                    return SEQFILE_CLOSERR;
+                }
+                return SEQFILE_GETPOSERR;
+            }
+        } else {
+            beg_pos = end_pos;
+        }
+        memset(&sml_info, 0, sizeof(sml_info));
+        ret = read_seqfile_order(seq_info, &sml_info);
+        if (SEQFILE_ENDOFILERR == ret) {
+            seq_info->end_tag = SEQ_END_YES;
+            break;
+        } else if (OPERATE_OK != ret) {
+            return ret;
+        }
+        end_pos = ftello64(seq_info->fd);
+        if (end_pos < 0) {
+            if (fclose(seq_info->fd)) {
+                return SEQFILE_CLOSERR;
+            }
+            return SEQFILE_GETPOSERR;
+        }
+        
+        memset(sql_str, 0, sizeof(sql_str));
+        sprintf(sql_str, "replace into seq_index (name, pos, len) values ('%s', %llu, %llu);", sml_info.fname, beg_pos, end_pos-beg_pos);
+        if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+            return INDEXFILE_EXECERR;
+        }
+        
+        last_pos = beg_pos;
+        last_len = end_pos-beg_pos;
+    }
+    memset(index_name, 0, sizeof(index_name));
+    sprintf(index_name, "%s/.index_%s", seq_info->index_dir, seq_info->fname);
+    memset(sql_str, 0, sizeof(sql_str));
+    sprintf(sql_str, "replace into seq_index (name, pos, len) values ('%s', %llu, %llu);", index_name, last_pos, last_len);
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    memset(sql_str, 0, sizeof(sql_str));
+    strcpy(sql_str, "commit transaction;");
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    
+    return OPERATE_OK;
+}
+
+int8_t sync_indexfile(struct seqfile_info *seq_info)
+{
+    char sql_str[1024];
+    char index_name[512];
+    uint64_t index_end_pos;
+    struct indexfile_info index_info;
+    
+    memset(index_name, 0, sizeof(index_name));
+    sprintf(index_name, "%s/.index_%s", seq_info->index_dir, seq_info->fname);
+    
+    if (SQLITE_OK != sqlite3_open(index_name, &(seq_info->index_db))) {
+        return INDEXFILE_OPENERR;
+    }
+    
+    memset(sql_str, 0, sizeof(sql_str));
+    strcpy(sql_str, "create table if not exists seq_index (name text primary key, pos integer, len integer)");
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    
+    memset(sql_str, 0, sizeof(sql_str));
+    sprintf(sql_str, "select pos, len from seq_index where name='%s'", index_name);
+    memset(&index_info, 0, sizeof(index_info));
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,get_indexinfo,&index_info,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    
+    if (0 == index_info.num) {
+        memset(sql_str, 0, sizeof(sql_str));
+        sprintf(sql_str, "insert into seq_index values('%s', %llu, 0)", index_name, seq_info->head_len);
+        if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+            return INDEXFILE_EXECERR;
+        }
+        index_info.pos = seq_info->head_len;
+        index_info.len = 0;
+    } else if (1 == index_info.num) {
+        index_end_pos = index_info.pos+index_info.len;
+        if (seq_info->end_pos > index_end_pos) {
+            fill_indexfile(seq_info, index_end_pos);
+        } else if (seq_info->end_pos < index_end_pos) {
+            return INDEXFILE_OVERTOPERR;
+        }
+    } else {
+        return INDEXFILE_INFOERR;
+    }
+    
+    return OPERATE_OK;
+}
+
 int8_t open_seqfile(struct seqfile_info *seq_info)
 {
     int8_t ret;
     FILE *seq_fd;
     char seq_name[512];
+
+    if (!seq_info) {
+        return SEQFILE_INFOERR;
+    }
     
     ret = check_seq_info(seq_info);
     if (OPERATE_OK != ret) {
@@ -276,19 +432,25 @@ int8_t open_seqfile(struct seqfile_info *seq_info)
     seq_info->end_tag = SEQ_END_YES;
     seq_info->fd = seq_fd;
     
+    ret = sync_indexfile(seq_info);
+    if (OPERATE_OK != ret) {
+        return ret;
+    }
+    
     return OPERATE_OK;
 }
 
-/* todo save index in memory */
 int8_t write_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_info)
 {
+    int8_t ret;
     uint32_t net_len;
     uint8_t sync_tag;
+    uint64_t beg_pos;
     
     if (!seq_info || !(seq_info->fd)) {
         return SEQFILE_INFOERR;
     }
-
+    
     if (!sml_info) {
         return SMLFILE_INFOERR;
     }
@@ -311,6 +473,8 @@ int8_t write_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_inf
         
         seq_info->end_tag = SEQ_END_YES;
     }
+    
+    beg_pos = seq_info->end_pos;
     
     net_len = htonl(sml_info->nlen);
     fwrite(&net_len, sizeof(net_len), 1, seq_info->fd);
@@ -335,19 +499,83 @@ int8_t write_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_inf
     
     fwrite(seq_info->sync_str, seq_info->sync_len, 1, seq_info->fd);
     seq_info->end_pos += seq_info->sync_len;
+
+    strcpy(seq_info->info[seq_info->cache_num].fname, sml_info->fname);
+    seq_info->info[seq_info->cache_num].pos = beg_pos;
+    seq_info->info[seq_info->cache_num].len = seq_info->end_pos-beg_pos;
+
+    seq_info->cache_num++;
+    if (seq_info->cache_num >= INDEX_CACHE_NUM) {
+        ret = flush_seqfile(seq_info);
+        if (OPERATE_OK != ret) {
+            return ret;
+        }
+    }
     
     return OPERATE_OK;
 }
 
-/* todo sync index file */
+int8_t flush_indexfile(struct seqfile_info *seq_info)
+{
+    uint16_t i;
+    uint64_t last_pos;
+    uint32_t last_len;
+    char sql_str[256];
+    char index_name[512];
+    
+    memset(sql_str, 0, sizeof(sql_str));
+    strcpy(sql_str, "begin transaction;");
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    for (i=0; i<seq_info->cache_num; i++) {
+        memset(sql_str, 0, sizeof(sql_str));
+        sprintf(sql_str, "replace into seq_index (name, pos, len) values ('%s', %llu, %llu);",
+                seq_info->info[i].fname, seq_info->info[i].pos, seq_info->info[i].len);
+        if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+            return INDEXFILE_EXECERR;
+        }
+        last_pos = seq_info->info[i].pos;
+        last_len = seq_info->info[i].len;
+    }
+    memset(index_name, 0, sizeof(index_name));
+    sprintf(index_name, "%s/.index_%s", seq_info->index_dir, seq_info->fname);
+    memset(sql_str, 0, sizeof(sql_str));
+    sprintf(sql_str, "replace into seq_index (name, pos, len) values ('%s', %llu, %llu);", index_name, last_pos, last_len);
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    memset(sql_str, 0, sizeof(sql_str));
+    strcpy(sql_str, "commit transaction;");
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,NULL,NULL,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    
+    seq_info->cache_num = 0;
+    memset(seq_info->info, 0, INDEX_CACHE_NUM*sizeof(struct indexfile_info));
+    
+    return OPERATE_OK;
+}
+
 int8_t flush_seqfile(struct seqfile_info *seq_info)
 {
+    int8_t ret;
+    
     if (!seq_info || !(seq_info->fd)) {
         return SEQFILE_INFOERR;
+    }
+
+    if (0 == seq_info->cache_num) {
+        return OPERATE_OK;
     }
     
     if (fflush(seq_info->fd)) {
         return SEQFILE_FLUSHERR;
+    }
+    
+    ret = flush_indexfile(seq_info);
+    if (OPERATE_OK != ret) {
+        return ret;
     }
     
     return OPERATE_OK;
@@ -371,9 +599,9 @@ int8_t goto_1st_smlfile(struct seqfile_info *seq_info)
     return OPERATE_OK;
 }
 
-int8_t read_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_info)
+int8_t read_seqfile_order(struct seqfile_info *seq_info, struct smlfile_info *sml_info)
 {
-    uint64_t now_pos;
+    int64_t now_pos;
     uint8_t sync_len;
     uint8_t sync_tag;
     char sync_str[64];
@@ -417,15 +645,73 @@ int8_t read_seqfile(struct seqfile_info *seq_info, struct smlfile_info *sml_info
     return OPERATE_OK;
 }
 
-/* todo sync index file */
-int8_t close_seqfile(struct seqfile_info *seq_info)
+int8_t read_seqfile_by_name(struct seqfile_info *seq_info, struct smlfile_info *sml_info)
 {
+    int8_t ret;
+    char sql_str[512];
+    struct indexfile_info index_info;
+    
     if (!seq_info || !(seq_info->fd)) {
         return SEQFILE_INFOERR;
     }
+    
+    if (!sml_info) {
+        return SMLFILE_INFOERR;
+    }
 
+    ret = flush_seqfile(seq_info);
+    if (OPERATE_OK != ret) {
+        return ret;
+    }
+    
+    memset(sql_str, 0, sizeof(sql_str));
+    sprintf(sql_str, "select pos, len from seq_index where name='%s'", sml_info->fname);
+    memset(&index_info, 0, sizeof(index_info));
+    if (SQLITE_OK != sqlite3_exec(seq_info->index_db,sql_str,get_indexinfo,&index_info,&(seq_info->err_msg))) {
+        return INDEXFILE_EXECERR;
+    }
+    
+    if (1 == index_info.num) {
+        if (fseeko64(seq_info->fd,index_info.pos,SEEK_SET) < 0) {
+            if (fclose(seq_info->fd)) {
+                return SEQFILE_CLOSERR;
+            }
+            return SEQFILE_SEEKERR;
+        }
+        seq_info->end_tag = SEQ_END_NO;
+        ret = read_seqfile_order(seq_info, sml_info);
+        if (OPERATE_OK != ret) {
+            return ret;
+        }
+    } else if (0 == index_info.num) {
+        return SMLFILE_NONENTITY;
+    }else {
+        return INDEXFILE_INFOERR;
+    }
+    
+    return OPERATE_OK;
+}
+
+int8_t close_seqfile(struct seqfile_info *seq_info)
+{
+    int8_t ret;
+    
+    if (!seq_info || !(seq_info->fd)
+        || !(seq_info->index_db)) {
+        return SEQFILE_INFOERR;
+    }
+
+    ret = flush_seqfile(seq_info);
+    if (OPERATE_OK != ret) {
+        return ret;
+    }
+    
     if (fclose(seq_info->fd)) {
         return SEQFILE_CLOSERR;
+    }
+    
+    if (SQLITE_OK != sqlite3_close(seq_info->index_db)) {
+        return INDEXFILE_CLOSERR;
     }
     
     return OPERATE_OK;

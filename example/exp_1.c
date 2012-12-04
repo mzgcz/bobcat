@@ -37,7 +37,7 @@ int main(int argc, char *argv[])
     }
     
     memset(&sml_info, 0, sizeof(sml_info));
-    ret = read_seqfile(&seq_info, &sml_info);
+    ret = read_seqfile_order(&seq_info, &sml_info);
     if (OPERATE_OK != ret) {
         return ret;
     }
